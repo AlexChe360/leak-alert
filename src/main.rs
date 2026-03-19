@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     let mqtt_port: u16 = env("MQTT_PORT", "1883")
         .parse()
         .context("MQTT_PORT parse error")?;
-    let mqtt_topic = env("MQTT_TOPIC", "zigbee2mqtt/#");
+    let mqtt_topic = env("MQTT_TOPIC", "zigbee2mqtt/+");
     let serial_port = env("SERIAL_PORT", "/dev/ttyUSB4");
     let phone_number = env("PHONE_NUMBER", "+77078185115");
     let sms_cooldown_secs: u64 = env("SMS_COOLDOWN_SECS", "300")
@@ -122,6 +122,7 @@ async fn send_sms(port_path: &str, phone: &str, text: &str) -> Result<()> {
 
     at(&mut port, "AT\r", "OK").await?;
     at(&mut port, "AT+CMEE=2\r", "OK").await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     at(&mut port, "AT+CMGF=1\r", "OK").await?;
 
     let cmd = format!("AT+CMGS=\"{}\"\r", phone);
@@ -155,7 +156,11 @@ async fn write_and_wait_for_prompt(port: &mut SerialStream, cmd: &str) -> Result
     port.write_all(cmd.as_bytes()).await?;
     port.flush().await?;
 
+    // 💡 ВАЖНО: даём модему подумать
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
     let resp = read_response(port, Duration::from_secs(5)).await?;
+
     if resp.contains('>') {
         Ok(())
     } else {
