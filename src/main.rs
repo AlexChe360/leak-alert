@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tracing::{error, info, warn};
+use tokio_serial::{FlowControl, DataBits, Parity, StopBits};
 
 #[derive(Debug, Deserialize)]
 struct LeakPayload {
@@ -116,28 +117,56 @@ fn env(key: &str, default: &str) -> String {
 }
 
 async fn send_sms(port_path: &str, phone: &str, text: &str) -> Result<()> {
-    let mut port = tokio_serial::new(port_path, 115200)
+    let builder = tokio_serial::new(port_path, 115200)
+        .data_bits(DataBits::Eight)
+        .parity(Parity::None)
+        .stop_bits(StopBits::One)
+        .flow_control(FlowControl::None);
+
+    let mut port = builder
         .open_native_async()
         .with_context(|| format!("Failed to open serial port {}", port_path))?;
 
+    drain_port(&mut port).await?;
+
     at(&mut port, "AT\r", "OK").await?;
     at(&mut port, "AT+CMEE=2\r", "OK").await?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
     at(&mut port, "AT+CMGF=1\r", "OK").await?;
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    drain_port(&mut port).await?;
 
     let cmd = format!("AT+CMGS=\"{}\"\r", phone);
     write_and_wait_for_prompt(&mut port, &cmd).await?;
 
+    tokio::time::sleep(Duration::from_millis(300)).await;
     port.write_all(text.as_bytes()).await?;
     port.write_all(&[26]).await?;
     port.flush().await?;
 
-    let resp = read_response(&mut port, Duration::from_secs(10)).await?;
+    let resp = read_response(&mut port, Duration::from_secs(15)).await?;
     if resp.contains("+CMGS") && resp.contains("OK") {
         Ok(())
     } else {
         Err(anyhow!("SMS send failed: {}", resp))
     }
+}
+
+async fn drain_port(port: &mut SerialStream) -> Result<()> {
+    let mut buf = [0u8; 512];
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(150), port.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                continue;
+            }
+            Ok(Ok(_)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+
+    Ok(())
 }
 
 async fn at(port: &mut SerialStream, cmd: &str, expected: &str) -> Result<String> {
@@ -153,19 +182,39 @@ async fn at(port: &mut SerialStream, cmd: &str, expected: &str) -> Result<String
 }
 
 async fn write_and_wait_for_prompt(port: &mut SerialStream, cmd: &str) -> Result<()> {
+    drain_port(port).await?;
+
     port.write_all(cmd.as_bytes()).await?;
     port.flush().await?;
 
-    // 💡 ВАЖНО: даём модему подумать
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let start = Instant::now();
+    let mut buf = [0u8; 256];
+    let mut out = Vec::new();
 
-    let resp = read_response(port, Duration::from_secs(5)).await?;
+    while start.elapsed() < Duration::from_secs(8) {
+        match tokio::time::timeout(Duration::from_millis(500), port.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                out.extend_from_slice(&buf[..n]);
+                let s = String::from_utf8_lossy(&out);
 
-    if resp.contains('>') {
-        Ok(())
-    } else {
-        Err(anyhow!("No SMS prompt received: {}", resp))
+                if s.contains('>') {
+                    return Ok(());
+                }
+
+                if s.contains("ERROR") || s.contains("+CMS ERROR") {
+                    return Err(anyhow!("CMGS failed before prompt: {}", s));
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(anyhow!("Serial read error: {}", e)),
+            Err(_) => {}
+        }
     }
+
+    Err(anyhow!(
+        "No SMS prompt received: {}",
+        String::from_utf8_lossy(&out)
+    ))
 }
 
 async fn read_response(port: &mut SerialStream, timeout: Duration) -> Result<String> {
