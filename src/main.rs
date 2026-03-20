@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
         .context("MQTT_PORT parse error")?;
     let mqtt_topic = env("MQTT_TOPIC", "zigbee2mqtt/+");
     let serial_port = env("SERIAL_PORT", "/dev/ttyUSB4");
-    let phone_number = env("PHONE_NUMBER", "+77078185115");
+    let phone_number = env("PHONE_NUMBER", "+77078788383");
     let sms_cooldown_secs: u64 = env("SMS_COOLDOWN_SECS", "300")
         .parse()
         .context("SMS_COOLDOWN_SECS parse error")?;
