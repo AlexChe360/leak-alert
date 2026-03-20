@@ -4,9 +4,10 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio_serial::{
+    DataBits, FlowControl, Parity, SerialPortBuilderExt, SerialStream, StopBits,
+};
 use tracing::{error, info, warn};
-use tokio_serial::{FlowControl, DataBits, Parity, StopBits};
 
 #[derive(Debug, Deserialize)]
 struct LeakPayload {
@@ -19,9 +20,7 @@ struct LeakPayload {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let mqtt_host = env("MQTT_HOST", "127.0.0.1");
     let mqtt_port: u16 = env("MQTT_PORT", "1883")
@@ -65,41 +64,37 @@ async fn main() -> Result<()> {
 
                 let data: LeakPayload = match serde_json::from_str(&payload) {
                     Ok(v) => v,
-                    Err(_) => {
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
 
                 if data.water_leak != Some(true) {
                     continue;
                 }
 
+                let raw_sensor = extract_sensor_name(&topic);
+                let sensor = human_sensor_name(&raw_sensor);
+
+                let dedupe_key = sensor.to_string();
                 let now = Instant::now();
-                if let Some(last) = last_sent.get(&topic) {
+
+                if let Some(last) = last_sent.get(&dedupe_key) {
                     if now.duration_since(*last) < cooldown {
-                        info!("Skip duplicate alert for {}", topic);
+                        info!("Skip duplicate alert for {}", sensor);
                         continue;
                     }
                 }
 
-                let message = format!(
-                    "ALERT: Water leak detected!\nDevice: {}\nBattery: {:?}\nVoltage: {:?}\nTamper: {:?}\nLQI: {:?}",
-                    topic,
-                    data.battery,
-                    data.voltage,
-                    data.tamper,
-                    data.linkquality
-                );
+                let message = build_sms(sensor);
 
-                info!("Leak detected on {}", topic);
+                info!("Leak detected on topic={} sensor={}", topic, sensor);
 
                 match send_sms(&serial_port, &phone_number, &message).await {
                     Ok(_) => {
                         info!("SMS sent to {}", phone_number);
-                        last_sent.insert(topic, now);
+                        last_sent.insert(dedupe_key, now);
                     }
                     Err(e) => {
-                        error!("SMS send failed: {:?}", e);
+                        error!("SMS send failed: {}", e);
                     }
                 }
             }
@@ -116,6 +111,31 @@ fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+fn extract_sensor_name(topic: &str) -> String {
+    topic.split('/').last().unwrap_or("unknown").to_string()
+}
+
+fn human_sensor_name(name: &str) -> &str {
+    match name {
+        "Kotelna" => "Котельная",
+        "Tualet niz" => "Нижний туалет",
+        "Vhod" => "Ввод",
+        "Tualet vverh" => "Верхний туалет",
+        _ => "Неизвестно",
+    }
+}
+
+fn to_ucs2_hex(s: &str) -> String {
+    s.encode_utf16()
+        .map(|u| format!("{:04X}", u))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn build_sms(sensor: &str) -> String {
+    format!("ТРЕВОГА!\nУтечка воды: {}", sensor)
+}
+
 async fn send_sms(port_path: &str, phone: &str, text: &str) -> Result<()> {
     let builder = tokio_serial::new(port_path, 115200)
         .data_bits(DataBits::Eight)
@@ -129,42 +149,22 @@ async fn send_sms(port_path: &str, phone: &str, text: &str) -> Result<()> {
 
     drain_port(&mut port).await?;
 
-    let r = at(&mut port, "AT\r\n", "OK").await?;
-    info!("AT => {:?}", r);
+    at(&mut port, "AT\r", "OK").await?;
+    at(&mut port, "AT+CMGF=1\r", "OK").await?;
+    at(&mut port, "AT+CSCS=\"UCS2\"\r", "OK").await?;
+    at(&mut port, "AT+CSMP=17,167,0,8\r", "OK").await?;
 
-    let r = at(&mut port, "AT+CMEE=2\r\n", "OK").await?;
-    info!("AT+CMEE=2 => {:?}", r);
+    let phone_ucs2 = to_ucs2_hex(phone);
+    let text_ucs2 = to_ucs2_hex(text);
 
-    let r = at(&mut port, "AT+CPIN?\r\n", "OK").await?;
-    info!("AT+CPIN? => {:?}", r);
+    let cmd = format!("AT+CMGS=\"{}\"\r", phone_ucs2);
+    wait_for_prompt(&mut port, &cmd).await?;
 
-    let r = at(&mut port, "AT+CSQ\r\n", "OK").await?;
-    info!("AT+CSQ => {:?}", r);
-
-    let r = at(&mut port, "AT+CREG?\r\n", "OK").await?;
-    info!("AT+CREG? => {:?}", r);
-
-    let r = at(&mut port, "AT+CMGF=1\r\n", "OK").await?;
-    info!("AT+CMGF=1 => {:?}", r);
-
-    let r = at(&mut port, "AT+CSCA?\r\n", "OK").await?;
-    info!("AT+CSCA? => {:?}", r);
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    drain_port(&mut port).await?;
-
-    let cmd = format!("AT+CMGS=\"{}\"\r\n", phone);
-    let prompt_resp = write_and_wait_for_prompt(&mut port, &cmd).await?;
-    info!("AT+CMGS prompt => {:?}", prompt_resp);
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    port.write_all(text.as_bytes()).await?;
+    port.write_all(text_ucs2.as_bytes()).await?;
     port.write_all(&[26]).await?;
     port.flush().await?;
 
-    let resp = read_response(&mut port, Duration::from_secs(20)).await?;
-    info!("AT+CMGS final => {:?}", resp);
-
+    let resp = read_response(&mut port, Duration::from_secs(15)).await?;
     if resp.contains("+CMGS") && resp.contains("OK") {
         Ok(())
     } else {
@@ -172,8 +172,21 @@ async fn send_sms(port_path: &str, phone: &str, text: &str) -> Result<()> {
     }
 }
 
+async fn at(port: &mut SerialStream, cmd: &str, expected: &str) -> Result<String> {
+    drain_port(port).await?;
+    port.write_all(cmd.as_bytes()).await?;
+    port.flush().await?;
+
+    let resp = read_response(port, Duration::from_secs(5)).await?;
+    if resp.contains(expected) {
+        Ok(resp)
+    } else {
+        Err(anyhow!("AT failed: cmd={} resp={:?}", cmd.trim(), resp))
+    }
+}
+
 async fn drain_port(port: &mut SerialStream) -> Result<()> {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 256];
 
     loop {
         match tokio::time::timeout(Duration::from_millis(150), port.read(&mut buf)).await {
@@ -187,21 +200,7 @@ async fn drain_port(port: &mut SerialStream) -> Result<()> {
     Ok(())
 }
 
-async fn at(port: &mut SerialStream, cmd: &str, expected: &str) -> Result<String> {
-    drain_port(port).await?;
-
-    port.write_all(cmd.as_bytes()).await?;
-    port.flush().await?;
-
-    let resp = read_response(port, Duration::from_secs(5)).await?;
-    if resp.contains(expected) {
-        Ok(resp)
-    } else {
-        Err(anyhow!("AT failed: cmd={} resp={:?}", cmd.trim(), resp))
-    }
-}
-
-async fn write_and_wait_for_prompt(port: &mut SerialStream, cmd: &str) -> Result<String> {
+async fn wait_for_prompt(port: &mut SerialStream, cmd: &str) -> Result<()> {
     drain_port(port).await?;
 
     port.write_all(cmd.as_bytes()).await?;
@@ -211,18 +210,18 @@ async fn write_and_wait_for_prompt(port: &mut SerialStream, cmd: &str) -> Result
     let mut buf = [0u8; 256];
     let mut out = Vec::new();
 
-    while start.elapsed() < Duration::from_secs(15) {
+    while start.elapsed() < Duration::from_secs(10) {
         match tokio::time::timeout(Duration::from_millis(500), port.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
                 out.extend_from_slice(&buf[..n]);
-                let s = String::from_utf8_lossy(&out).to_string();
+                let s = String::from_utf8_lossy(&out);
 
                 if s.contains('>') {
-                    return Ok(s);
+                    return Ok(());
                 }
 
                 if s.contains("ERROR") || s.contains("+CMS ERROR") {
-                    return Err(anyhow!("CMGS failed before prompt: {:?}", s));
+                    return Err(anyhow!("CMGS failed before prompt: {}", s));
                 }
             }
             Ok(Ok(_)) => {}
@@ -232,8 +231,8 @@ async fn write_and_wait_for_prompt(port: &mut SerialStream, cmd: &str) -> Result
     }
 
     Err(anyhow!(
-        "No SMS prompt received, raw modem response: {:?}",
-        String::from_utf8_lossy(&out).to_string()
+        "No SMS prompt received: {}",
+        String::from_utf8_lossy(&out)
     ))
 }
 
@@ -243,7 +242,7 @@ async fn read_response(port: &mut SerialStream, timeout: Duration) -> Result<Str
     let mut out = Vec::new();
 
     while start.elapsed() < timeout {
-        match tokio::time::timeout(Duration::from_millis(500), port.read(&mut buf)).await {
+        match tokio::time::timeout(Duration::from_millis(400), port.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
                 out.extend_from_slice(&buf[..n]);
                 let s = String::from_utf8_lossy(&out);
